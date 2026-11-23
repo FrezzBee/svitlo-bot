@@ -32,7 +32,7 @@ from PIL import Image
 
 API = "https://api-voe-poweron.inneti.net"
 KYIV = ZoneInfo("Europe/Kyiv")
-STATE_FILE = Path(__file__).with_name("state.json")
+STATE_FILE = Path(os.environ.get("STATE_FILE") or Path(__file__).with_name("state.json"))
 SUBQUEUES = [f"{q}.{s}" for q in range(1, 7) for s in (1, 2)]  # 1.1 … 6.2
 
 # Кольори клітинок на картинці «Волиньобленерго»
@@ -305,20 +305,24 @@ HELLO = (
     "👋 Привіт! Я надсилатиму графік відключень «Волиньобленерго» для вашої черги: "
     "щойно з'явиться графік на новий день або зміняться години.\n\n"
     "📅 <b>Графік</b> — показати графік на сьогодні й завтра\n"
-    "⚙️ <b>Моя черга</b> — обрати чергу\n\n"
-    "⏳ Я працюю на GitHub Actions і перевіряю повідомлення приблизно раз на 10 хвилин, "
+    "⚙️ <b>Моя черга</b> — обрати чергу"
+)
+DELAY_NOTE = (
+    "\n\n⏳ Я працюю на GitHub Actions і перевіряю повідомлення приблизно раз на 10 хвилин, "
     "тож відповідаю не миттєво."
 )
+LOOP_MODE = False
 
 
-def handle_updates(tg, state, allowed, default_queues):
+def handle_updates(tg, state, allowed, default_queues, poll_timeout=0):
     """Обробляє повідомлення й кнопки. Повертає {chat_id: True} — кому надіслати графік."""
     chats = state.setdefault("chats", {})
     requests_graph = {}
     offset = state.get("tg_offset")
-    updates = tg.call("getUpdates", quiet=True, offset=offset, timeout=0,
+    updates = tg.call("getUpdates", quiet=True, offset=offset, timeout=poll_timeout,
                       allowed_updates=["message", "callback_query"]) or []
-    log(f"Нових повідомлень боту: {len(updates)}")
+    if updates or not poll_timeout:
+        log(f"Нових повідомлень боту: {len(updates)}")
 
     for upd in updates:
         state["tg_offset"] = upd["update_id"] + 1
@@ -358,7 +362,7 @@ def handle_updates(tg, state, allowed, default_queues):
 
         text = (msg.get("text") or "").strip()
         if text.startswith("/start"):
-            tg.send(chat_id, HELLO, MAIN_KEYBOARD)
+            tg.send(chat_id, HELLO + ("" if LOOP_MODE else DELAY_NOTE), MAIN_KEYBOARD)
             if not chat["queues"]:
                 tg.send(chat_id, queue_prompt(chat["queues"]), queue_keyboard(chat["queues"]))
         elif text in (BTN_QUEUE, "/queue", "/cherga"):
@@ -404,7 +408,7 @@ def build_caption(day, today, created, queues, grid, old_mine, first):
     return "\n".join(lines)
 
 
-def main():
+def setup():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     allowed = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()}
     default_queues = [q.strip() for q in os.environ.get("QUEUE", "").split(",")
@@ -428,8 +432,10 @@ def main():
     for cid in allowed:
         state["chats"].setdefault(cid, {"queues": list(default_queues), "sent": {}})
 
-    asked = handle_updates(tg, state, allowed, default_queues)
+    return tg, state, allowed, default_queues, notify_all
 
+
+def check_and_notify(tg, state, allowed, notify_all, asked):
     # ---- графіки
     today = datetime.now(KYIV).date()
     days = {today, today + timedelta(days=1)}
@@ -487,8 +493,48 @@ def main():
     state["days"] = {k: v for k, v in state["days"].items() if k >= keep}
     for chat in state["chats"].values():
         chat["sent"] = {k: v for k, v in chat["sent"].items() if k >= keep}
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def main():
+    """Один запуск — для GitHub Actions."""
+    tg, state, allowed, default_queues, notify_all = setup()
+    asked = handle_updates(tg, state, allowed, default_queues)
+    check_and_notify(tg, state, allowed, notify_all, asked)
+    save_state(state)
+
+
+def main_loop(check_every=300):
+    """Постійна робота — для сервера: відповідає одразу, графік перевіряє кожні 5 хвилин."""
+    import time
+    global LOOP_MODE
+    LOOP_MODE = True
+    tg, state, allowed, default_queues, notify_all = setup()
+    log("Бот запущено в постійному режимі")
+    last_check = 0.0
+    while True:
+        try:
+            asked = handle_updates(tg, state, allowed, default_queues, poll_timeout=50)
+            if asked or time.time() - last_check >= check_every:
+                check_and_notify(tg, state, allowed, notify_all, asked)
+                last_check = time.time()
+            save_state(state)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:  # мережа, сайт обленерго тощо — чекаємо і пробуємо знову
+            log(f"Помилка: {e!r}. Повтор за 30 с")
+            save_state(state)
+            time.sleep(30)
 
 
 if __name__ == "__main__":
-    main()
+    if "--loop" in sys.argv:
+        main_loop()
+    else:
+        main()
